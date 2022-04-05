@@ -34,6 +34,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.util.*
 import java.util.zip.GZIPInputStream
+import kotlin.collections.HashSet
 import kotlin.system.exitProcess
 import kotlin.system.measureTimeMillis
 
@@ -114,17 +115,29 @@ class Checker : CliktCommand() {
         help = "set the bootclasspath"
     )
 
-    val onlyContracts by option(
+    val onlyContractsRaw by option(
         "--contract",
         help = "whitelist contracts by their names"
     )
         .multiple()
 
-    val forbidContracts by option(
+    val onlyContractsFiles by option(
+            "--contracts-file",
+            help = "whitelist contracts by their names from a file"
+    )
+            .multiple()
+
+    val forbidContractsRaw by option(
         "--forbid-contact",
         help = "forbid contracts by their name"
     )
         .multiple()
+
+    val forbidContractsFiles by option(
+            "--forbid-contracts-file",
+            help = "forbid contracts by their names from a file"
+    )
+            .multiple()
 
     val inputFile by argument(
         "JAVA-KEY-FILE",
@@ -167,7 +180,22 @@ class Checker : CliktCommand() {
 
         testSuites.name = inputFile.joinToString(" ")
 
-        inputFile.forEach { run(it) }
+        val onlyContracts =
+            (onlyContractsFiles.flatMap {
+                File(it).readLines()
+            } + onlyContractsRaw)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                    .toHashSet()
+
+        val forbidContracts = (forbidContractsFiles.flatMap {
+            File(it).readLines()
+        } + forbidContractsRaw)
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("#")}
+                .toHashSet()
+
+        inputFile.forEach { run(it, onlyContracts, forbidContracts) }
 
         statisticsFile?.writeText(obj2json(statistics))
 
@@ -197,7 +225,7 @@ class Checker : CliktCommand() {
             println(message)
     }
 
-    fun run(inputFile: String) {
+    fun run(inputFile: String, onlyContracts: HashSet<String>, forbidContracts: HashSet<String>) {
         printBlock("[INFO] Start with `$inputFile`") {
             val pm = KeYApi.loadProof(File(inputFile),
                 classpath.map { File(it) },
@@ -206,6 +234,7 @@ class Checker : CliktCommand() {
 
             val contracts = pm.proofContracts
                 .filter { it.name in onlyContracts || onlyContracts.isEmpty() }
+                .sortedBy { it.name }
 
             printm("[INFO] Found: ${contracts.size}")
             var successful = 0
@@ -334,8 +363,9 @@ class Checker : CliktCommand() {
     }
 
     private fun loadProof(keyFile: File): ProofState {
-        val env = KeYEnvironment.load(keyFile)
+        var env: KeYEnvironment<*>? = null
         try {
+            env = KeYEnvironment.load(keyFile)
             val proof = env?.loadedProof
             try {
                 if (proof == null) {
@@ -344,11 +374,19 @@ class Checker : CliktCommand() {
                 }
                 printStatistics(proof)
                 return if (proof.closed()) ProofState.Success else ProofState.Failed
+            }  catch (e: Exception) {
+                printm("[ERR] Failed to find statistics")
+                e.printStackTrace()
+                return ProofState.Failed
             } finally {
                 proof?.dispose()
             }
+        } catch (e: Exception) {
+            printm("[ERR] Failed load proof")
+            e.printStackTrace()
+            return ProofState.Failed
         } finally {
-            env.dispose()
+            env?.dispose()
         }
     }
 
