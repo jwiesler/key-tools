@@ -30,11 +30,13 @@ import de.uka.ilkd.key.speclang.Contract
 import de.uka.ilkd.key.util.KeYConstants
 import de.uka.ilkd.key.util.MiscTools
 import org.key_project.util.collection.ImmutableList
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.util.*
 import java.util.zip.GZIPInputStream
-import kotlin.collections.HashSet
 import kotlin.system.exitProcess
 import kotlin.system.measureTimeMillis
 
@@ -48,12 +50,18 @@ const val MAGENTA = 35
 const val CYAN = 36
 fun color(s: Any, c: Int) = "${ESC}[${c}m$s${ESC}[0m"
 
+private inline fun <reified T> logger(): Logger {
+    return LoggerFactory.getLogger(T::class.java)
+}
+
 /**
  * A small interface for a checker scripts
  * @author Alexander Weigl
  * @version 1 (21.11.19)
  */
 class Checker : CliktCommand() {
+    val logger = logger<Checker>()
+
     private val statistics = TreeMap<String, Any>()
 
     val junitXmlOutput by option("--xml-output").file()
@@ -127,6 +135,11 @@ class Checker : CliktCommand() {
     )
             .multiple()
 
+    val onlyContractsFilter by option(
+            "--contracts-filter",
+            help = "filter contracts by their names using a regex"
+    )
+
     val forbidContractsRaw by option(
         "--forbid-contact",
         help = "forbid contracts by their name"
@@ -166,15 +179,15 @@ class Checker : CliktCommand() {
     var testSuites = TestSuites()
 
     override fun run() {
-        printm("KeY version: ${KeYConstants.VERSION}")
-        printm("KeY internal: ${KeYConstants.INTERNAL_VERSION}")
-        printm("Copyright: ${KeYConstants.COPYRIGHT}")
-        printm("More information at: https://formal.iti.kit.edu/weigl/ci-tool/")
+        logger.info("KeY version: ${KeYConstants.VERSION}")
+        logger.info("KeY internal: ${KeYConstants.INTERNAL_VERSION}")
+        logger.info("Copyright: ${KeYConstants.COPYRIGHT}")
+        logger.info("More information at: https://formal.iti.kit.edu/weigl/ci-tool/")
 
         if (debug) {
-            printm("Proof files and Sripts found: ")
+            logger.info("Proof files and Sripts found: ")
             proofFileCandidates.forEach {
-                printm(it.absolutePath)
+                logger.info(it.absolutePath)
             }
         }
 
@@ -208,127 +221,114 @@ class Checker : CliktCommand() {
         exitProcess(errors)
     }
 
-    var currentPrintLevel = 0
-    fun printBlock(message: String, f: () -> Unit) {
-        printm(message)
-        currentPrintLevel++
-        f()
-        currentPrintLevel--
-    }
-
-
-    fun printm(message: String, fg: Int? = null) {
-        print("  ".repeat(currentPrintLevel))
-        if (fg != null)
-            println(color(message, fg))
-        else
-            println(message)
-    }
-
     fun run(inputFile: String, onlyContracts: HashSet<String>, forbidContracts: HashSet<String>) {
-        printBlock("[INFO] Start with `$inputFile`") {
-            val pm = KeYApi.loadProof(File(inputFile),
-                classpath.map { File(it) },
-                bootClassPath?.let { File(it) },
-                includes.map { File(it) })
+        logger.info("Start with `$inputFile`")
+        val pm = KeYApi.loadProof(File(inputFile),
+            classpath.map { File(it) },
+            bootClassPath?.let { File(it) },
+            includes.map { File(it) })
 
-            val contracts = pm.proofContracts
-                .filter { it.name in onlyContracts || onlyContracts.isEmpty() }
-                .sortedBy { it.name }
+        // println(onlyContractsFilter)
+        // pm.proofContracts
+        //         .sortedWith(
+        //                 compareBy<Contract> {
+        //                     it.name.substringBeforeLast('.').substringAfterLast('.')
+        //                 }.thenBy { it.name })
+        //         .forEach { println(it.name) }
+        // println()
 
-            printm("[INFO] Found: ${contracts.size}")
-            var successful = 0
-            var ignored = 0
-            var failure = 0
+        logger.info("Found: ${pm.proofContracts.size} contracts")
+        val filter = onlyContractsFilter?.let { Regex(it) }
+        val (contracts, ignoredContracts) = pm.proofContracts
+            .filter {
+                (onlyContracts.isEmpty() || it.name in onlyContracts) &&
+                        (filter == null || filter.matches(it.name)) }
+            .sortedBy { it.name }
+            .partition { it.name !in forbidContracts }
 
-            val testSuite = testSuites.newTestSuite(inputFile)
-            ProofSettings.DEFAULT_SETTINGS.properties.forEach { t, u ->
-                testSuite.properties[t.toString()] = u
-            }
+        logger.info("Check: ${contracts.size} contracts (by only contracts)")
 
-            for (c in contracts) {
-                val testCase = testSuite.newTestCase(c.name)
-                printBlock("[INFO] Contract: `${c.name}`") {
-                    when {
-                        c.name in forbidContracts -> {
-                            printm(" [INFO] Contract excluded by `--forbid-contract`")
-                            testCase.result = TestCaseKind.Skipped("Contract excluded by `--forbid-contract`.")
-                            ignored++
+        var successful = 0
+        var ignored = 0
+        var failure = 0
+
+        val testSuite = testSuites.newTestSuite(inputFile)
+        ProofSettings.DEFAULT_SETTINGS.properties.forEach { t, u ->
+            testSuite.properties[t.toString()] = u
+        }
+
+        for (c in contracts) {
+            val testCase = testSuite.newTestCase(c.name)
+            logger.info("Contract: `${c.name}`")
+            when {
+                dryRun -> {
+                    testCase.result = TestCaseKind.Skipped("Contract skipped by `--dry-run`.")
+                    ignored++
+                }
+                else -> {
+                    when (runContract(pm, c)) {
+                        ProofState.Success -> successful++
+                        ProofState.Failed -> {
+                            testCase.result = TestCaseKind.Failure("Proof not closeable.")
+                            failure++
                         }
-                        dryRun -> {
-                            printm("[INFO] Contract skipped by `--dry-run`")
-                            testCase.result = TestCaseKind.Skipped("Contract skipped by `--dry-run`.")
-                            ignored++
-                        }
-                        else -> {
-                            val b = runContract(pm, c)
-                            when (b) {
-                                ProofState.Success -> successful++
-                                ProofState.Failed -> {
-                                    testCase.result = TestCaseKind.Failure("Proof not closeable.")
-                                    failure++
-                                }
-                                ProofState.Skipped -> ignored++
-                            }
-                        }
+                        ProofState.Skipped -> ignored++
                     }
                 }
             }
-            printm(
-                "[INFO] Summary for $inputFile: " +
-                        "(successful/ignored/failure) " +
-                        "(${color(successful, GREEN)}/${color(ignored, BLUE)}/${color(failure, RED)})"
-            )
-            if (failure != 0)
-                printm("[ERR ] $inputFile failed!", fg = RED)
         }
+        logger.info(
+            "Summary for $inputFile: " +
+                    "(successful/ignored/failure) " +
+                    "(${color(successful, GREEN)}/${color(ignored, BLUE)}/${color(failure, RED)})"
+        )
+        if (failure != 0)
+            logger.error("$inputFile failed!")
     }
 
     private fun runContract(pm: ProofManagementApi, contract: Contract): ProofState {
-        val proofApi = pm.startProof(contract)
-        val proof = proofApi.proof
-        require(proof != null)
-        proof.settings?.strategySettings?.maxSteps = autoModeStep
         ProofSettings.DEFAULT_SETTINGS.strategySettings.maxSteps = autoModeStep
-
         val proofFile = findProofFile(contract.name)
-        val scriptFile = findScriptFile(contract.name)
-        val ui = proofApi.env.ui as AbstractUserInterfaceControl
-        val pc = proofApi.env.proofControl as AbstractProofControl
 
-
-        val closed = when {
-            proofFile != null -> {
-                printm("[INFO] Proof found: $proofFile. Try loading.")
-                loadProof(proofFile)
-            }
-            scriptFile != null -> {
-                printm("[INFO] Script found: $scriptFile. Try proving.")
-                loadScript(ui, proof, scriptFile)
-            }
-            else -> {
-                if (verbose)
-                    printm("[INFO] No proof or script found. Fallback to auto-mode.")
-                if (disableAutoMode) {
-                    printm("[WARN] Proof skipped because to `--no-auto-mode' switch is set.")
-                    ProofState.Skipped
+        val closed = if (proofFile != null) {
+            logger.info("Proof found: $proofFile. Try loading.")
+            loadProof(proofFile)
+        } else {
+            val proofApi = pm.startProof(contract)
+            val proof = proofApi.proof
+            require(proof != null)
+            val scriptFile = findScriptFile(contract.name)
+            proof.settings?.strategySettings?.maxSteps = autoModeStep
+            val ui = proofApi.env.ui as AbstractUserInterfaceControl
+            val pc = proofApi.env.proofControl as AbstractProofControl
+            try {
+                if (scriptFile != null) {
+                    logger.info("Script found: $scriptFile. Try proving.")
+                    loadScript(ui, proof, scriptFile)
                 } else {
-                    runAutoMode(pc, proof)
+                    if (verbose)
+                        logger.info("No proof or script found. Fallback to auto-mode.")
+                    if (disableAutoMode) {
+                        logger.warn("Proof skipped because to `--no-auto-mode' switch is set.")
+                        ProofState.Skipped
+                    } else {
+                        runAutoMode(pc, proof)
+                    }
                 }
+            } finally {
+                proof.dispose()
             }
         }
 
         when (closed) {
-            ProofState.Success -> printm("[OK  ] ✔ Proof closed.", fg = GREEN)
-            ProofState.Skipped -> printm("[WARN] ! Proof skipped.", fg = YELLOW)
+            ProofState.Success -> logger.info(color("✔ Proof closed.", GREEN))
+            ProofState.Skipped -> logger.warn(color("! Proof skipped.", YELLOW))
             ProofState.Failed -> {
                 errors++
-                printm("[ERR ] ✘ Proof open.", fg = RED)
-                if (verbose)
-                    printm("[FINE] ${proof.openGoals().size()} remains open")
+                logger.error(color("✘ Proof open.", RED))
             }
         }
-        proof.dispose()
+
         return closed
     }
 
@@ -338,14 +338,14 @@ class Checker : CliktCommand() {
                 val mm = MeasuringMacro()
                 proofControl.runMacro(proof.root(), mm, null)
                 proofControl.waitWhileAutoMode()
-                printm("[INFO] Proof has open/closed before: ${mm.before}")
-                printm("[INFO] Proof has open/closed after: ${mm.after}")
+                logger.info("Proof has open/closed before: ${mm.before}")
+                logger.info("Proof has open/closed after: ${mm.after}")
             } else {
                 proofControl.startAndWaitForAutoMode(proof)
             }
         }
         if (verbose) {
-            printm("[FINE] Auto-mode took ${time / 1000.0} seconds.")
+            logger.info("Auto-mode took ${time / 1000.0} seconds.")
         }
         printStatistics(proof)
         return if (proof.closed()) ProofState.Success else ProofState.Failed
@@ -367,23 +367,52 @@ class Checker : CliktCommand() {
         try {
             env = KeYEnvironment.load(keyFile)
             val proof = env?.loadedProof
-            try {
-                if (proof == null) {
-                    printm("[ERR] No proof found in given KeY-file.", fg = 38)
-                    return ProofState.Failed
-                }
-                printStatistics(proof)
-                return if (proof.closed()) ProofState.Success else ProofState.Failed
-            }  catch (e: Exception) {
-                printm("[ERR] Failed to find statistics")
-                e.printStackTrace()
+            if (proof == null) {
+                logger.error("No proof found in given KeY-file.")
                 return ProofState.Failed
-            } finally {
-                proof?.dispose()
             }
+
+            if (!proof.closed()) {
+                val open = proof.openGoals().size();
+                logger.info("Proof has ${proof.openGoals().size()} open goals, running try close macro")
+                val pc = env.proofControl;
+                proof.openGoals().forEach {
+                    pc.runMacro(it.node(), TryCloseMacro(autoModeStep), null)
+                    var elapsedMillis = 0;
+                    while (pc.isInAutoMode) {
+                        try {
+                            Thread.sleep(100)
+                            elapsedMillis += 100
+                        } catch (ignored: InterruptedException) {}
+                        if (elapsedMillis == 60000) {
+                            logger.info("Failed to close goal ${it.node().serialNr()}")
+                            pc.stopAndWaitAutoMode()
+                            break
+                        }
+                    }
+                }
+                val delta = open - proof.openGoals().size()
+                logger.info("Closed $delta goals")
+                if (delta > 0) {
+                    logger.info("Saving proof")
+                    try {
+                        proof.saveToFile(keyFile)
+                    } catch(e: IOException) {
+                        logger.warn("Failed to load proof ", e)
+                    }
+                }
+            }
+
+            try {
+                printStatistics(proof)
+            }  catch (e: Exception) {
+                logger.error("Failed to find statistics")
+                e.printStackTrace()
+            }
+
+            return if (proof.closed()) ProofState.Success else ProofState.Failed
         } catch (e: Exception) {
-            printm("[ERR] Failed load proof")
-            e.printStackTrace()
+            logger.error("Failed load proof ", e)
             return ProofState.Failed
         } finally {
             env?.dispose()
@@ -396,7 +425,7 @@ class Checker : CliktCommand() {
             statistics[proof.name().toString()] = generateSummary(proof)
         }
         if (verbose) {
-            proof.statistics.summary.forEach { p -> printm("[FINE] ${p.first} = ${p.second}") }
+            proof.statistics.summary.forEach { p -> logger.info("${p.first} = ${p.second}") }
         }
         if (enableMeasuring) {
             val closedGoals = proof.getClosedSubtreeGoals(proof.root())
@@ -409,7 +438,7 @@ class Checker : CliktCommand() {
                     }
                 }
             }
-            printm("Visited lines:\n${visitLineOnClosedGoals.joinToString("\n")}")
+            logger.info("Visited lines:\n${visitLineOnClosedGoals.joinToString("\n")}")
         }
     }
 
